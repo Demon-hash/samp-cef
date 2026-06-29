@@ -10,8 +10,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::Event;
+use crate::ServerEvent;
 use crate::client::Client;
+use crate::client::State;
 
 enum Packet {
     Normal { peer: PeerId, bytes: Vec<u8> },
@@ -29,16 +30,17 @@ impl Packet {
 }
 
 pub struct Server {
-    event_tx: Sender<Event>,
-    event_rx: Receiver<Event>,
+    event_tx: Sender<ServerEvent>,
+    event_rx: Receiver<ServerEvent>,
     sender: Sender<Packet>,
     allowed: HashMap<IpAddr, i32>,
     clients: HashMap<PeerId, Client>,
 }
 
 impl Server {
-    pub fn new(addr: SocketAddr) -> Arc<Mutex<Server>> {
-        let mut socket = Socket::new_server(addr, CertStrategy::SelfSigned).unwrap();
+    pub fn new(addr: SocketAddr) -> Result<Arc<Mutex<Server>>, String> {
+        let mut socket = Socket::new_server(addr, CertStrategy::SelfSigned)
+            .map_err(|error| format!("failed to bind CEF server on {addr}: {error}"))?;
 
         let (sender, receiver) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -58,7 +60,6 @@ impl Server {
             loop {
                 while let Some(event) = socket.recv() {
                     match event {
-                        // если послали новый пакет
                         SocketEvent::Message(peer, bytes) => {
                             if let Ok(proto) = deserialize_from_slice::<packets::Packet>(&bytes) {
                                 let mut server = server.lock().unwrap();
@@ -66,13 +67,11 @@ impl Server {
                             }
                         }
 
-                        // обработка пакетов соединения
                         SocketEvent::Connected(peer, addr) => {
                             let mut server = server.lock().unwrap();
                             server.handle_new_connection(peer, addr);
                         }
 
-                        // таймауты
                         SocketEvent::Disconnect(peer, _) => {
                             let mut server = server.lock().unwrap();
                             server.handle_timeout(peer);
@@ -96,14 +95,12 @@ impl Server {
             }
         });
 
-        server_clone
+        Ok(server_clone)
     }
 
-    /// обработка пакетов от клиентов
     fn handle_client_packet(&mut self, peer: PeerId, packet: packets::Packet) {
         use messages::packets::PacketId;
 
-        // клиента нет пшел нахрен
         if !self.clients.contains_key(&peer) {
             return;
         }
@@ -128,18 +125,19 @@ impl Server {
         }
     }
 
-    /// обработка пакета авторизации
     fn handle_auth(&mut self, peer: PeerId, _packet: packets::RequestJoin) {
-        let client = self.clients.get_mut(&peer).unwrap(); // safe
+        let client = self.clients.get_mut(&peer).unwrap();
 
         let response = packets::JoinResponse {
             success: true,
             current_version: None,
         };
 
-        client.set_state(crate::client::State::Connected);
+        client.set_state(State::Connected);
 
-        let _ = self.event_tx.send(Event::PlayerConnected(client.id()));
+        let _ = self
+            .event_tx
+            .send(ServerEvent::PlayerConnected(client.id()));
 
         let _ = try_into_packet(response).map(|bytes| {
             let packet = Packet::new(peer, bytes);
@@ -148,13 +146,13 @@ impl Server {
     }
 
     fn handle_emit_event(&mut self, peer: PeerId, packet: packets::EmitEvent) {
-        let client = self.clients.get_mut(&peer).unwrap(); // safe
+        let client = self.clients.get_mut(&peer).unwrap();
         let player_id = client.id();
 
         if let Some(args) = &packet.args {
             let event = packet.event_name.to_string();
             let arguments = args.to_string();
-            let event = Event::EmitEvent {
+            let event = ServerEvent::EmitEvent {
                 player_id,
                 arguments,
                 event,
@@ -165,10 +163,10 @@ impl Server {
     }
 
     fn handle_browser_created(&mut self, peer: PeerId, packet: packets::BrowserCreated) {
-        let client = self.clients.get_mut(&peer).unwrap(); // safe
+        let client = self.clients.get_mut(&peer).unwrap();
         let player_id = client.id();
 
-        let event = Event::BrowserCreated {
+        let event = ServerEvent::BrowserCreated {
             player_id,
             browser_id: packet.browser_id,
             code: packet.status_code,
@@ -177,7 +175,6 @@ impl Server {
         let _ = self.event_tx.send(event);
     }
 
-    /// выпинываем игрока из списка клиентов
     fn handle_timeout(&mut self, addr: PeerId) {
         trace!("handle_timeout {:?}", addr);
         self.clients.remove(&addr);
@@ -186,7 +183,6 @@ impl Server {
         trace!("{:#?}", self.clients);
     }
 
-    /// обрабатывает новое входящее соединение
     fn handle_new_connection(&mut self, peer: PeerId, addr: SocketAddr) {
         trace!("handle_new_connection {:?} {:?}", peer, addr);
 
@@ -217,11 +213,17 @@ impl Server {
         let _ = self.sender.send(packet);
     }
 
-    // samp server side
-
     pub fn allow_connection(&mut self, player_id: i32, addr: IpAddr) {
         if let Some(peer) = self.peer_by_id(player_id) {
-            self.clients.remove(&peer);
+            let same_addr = self
+                .clients
+                .get(&peer)
+                .map(|client| client.addr().ip() == addr)
+                .unwrap_or(false);
+
+            if !same_addr {
+                self.clients.remove(&peer);
+            }
         }
 
         self.allowed.insert(addr, player_id);
@@ -379,11 +381,9 @@ impl Server {
         );
     }
 
-    pub fn receiver(&self) -> Receiver<Event> {
+    pub fn receiver(&self) -> Receiver<ServerEvent> {
         self.event_rx.clone()
     }
-
-    // utils
 
     fn send_packet<'a, T: TryInto<packets::Packet<'a>, Error = quick_protobuf::Error>>(
         &self, player_id: i32, packet: T,

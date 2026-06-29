@@ -26,11 +26,20 @@ jobs:
           toolchain: stable
           targets: i686-unknown-linux-gnu
 
-      - name: Install i386 deps
+      - name: Install build deps
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y build-essential g++-multilib
+          sudo apt-get install -y build-essential cmake git g++-multilib
+
+      - name: Checkout open.mp
+        uses: actions/checkout@v4
+        with:
+          repository: openmultiplayer/open.mp
+          path: open.mp
+
+      - name: Checkout open.mp SDK submodules
+        run: git -C open.mp submodule update --init --recursive SDK lib/pawn
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -56,12 +65,25 @@ jobs:
       - name: Build server plugin
         run: |
           cargo build --package server --release --target i686-unknown-linux-gnu
-          strip -s target/i686-unknown-linux-gnu/release/libserver.so -o stripped.so
+          strip -s target/i686-unknown-linux-gnu/release/libserver.so -o cef-samp.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: cef-${{ matrix.os }}.so
-          path: stripped.so
+          path: cef-samp.so
+
+      - name: Build open.mp component
+        run: |
+          scripts/build-openmp-component.sh \
+            --openmp-root "$GITHUB_WORKSPACE/open.mp" \
+            --build-dir "$GITHUB_WORKSPACE/target/openmp-component-build-${{ matrix.os }}" \
+            --jobs 2
+          strip -s "target/openmp-component-build-${{ matrix.os }}/cef.so" -o cef-openmp.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cef-openmp-${{ matrix.os }}.so
+          path: cef-openmp.so
 
   build_server_debian:
     runs-on: ubuntu-latest
@@ -71,11 +93,11 @@ jobs:
         os: [12, 13]
 
     steps:
-      - name: Install i386 deps
+      - name: Install build deps
         run: |
           dpkg --add-architecture i386
           apt-get update
-          apt-get install -y build-essential curl make g++-multilib
+          apt-get install -y build-essential ca-certificates cmake curl git make g++-multilib
 
       - name: Install stable + i686 target
         uses: dtolnay/rust-toolchain@master
@@ -84,6 +106,15 @@ jobs:
           targets: i686-unknown-linux-gnu
 
       - uses: actions/checkout@v4
+
+      - name: Checkout open.mp
+        uses: actions/checkout@v4
+        with:
+          repository: openmultiplayer/open.mp
+          path: open.mp
+
+      - name: Checkout open.mp SDK submodules
+        run: git -C open.mp submodule update --init --recursive SDK lib/pawn
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -109,12 +140,25 @@ jobs:
       - name: Build server plugin
         run: |
           cargo build --package server --release --target i686-unknown-linux-gnu
-          strip -s target/i686-unknown-linux-gnu/release/libserver.so -o stripped.so
+          strip -s target/i686-unknown-linux-gnu/release/libserver.so -o cef-samp.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: cef-debian-${{ matrix.os }}.so
-          path: stripped.so
+          path: cef-samp.so
+
+      - name: Build open.mp component
+        run: |
+          scripts/build-openmp-component.sh \
+            --openmp-root "$GITHUB_WORKSPACE/open.mp" \
+            --build-dir "$GITHUB_WORKSPACE/target/openmp-component-build-debian-${{ matrix.os }}" \
+            --jobs 2
+          strip -s "target/openmp-component-build-debian-${{ matrix.os }}/cef.so" -o cef-openmp.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cef-openmp-debian-${{ matrix.os }}.so
+          path: cef-openmp.so
 
   build_client:
     runs-on: windows-latest

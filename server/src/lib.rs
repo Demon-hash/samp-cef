@@ -1,48 +1,22 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
 use log::{info, trace};
-use messages::packets::EventValue;
-// use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode};
+use server_core::{CoreEvent, EventValue, ServerCore};
 
 use samp::amx::AmxIdent;
 use samp::args::Args;
 use samp::prelude::*;
 use samp::{exec_public, initialize_plugin, native};
 
-mod client;
-mod server;
 mod utils;
 
-use crate::server::Server;
-
-const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PORT_OFFSET: u16 = 2;
 
-pub enum Event {
-    EmitEvent {
-        player_id: i32,
-        event: String,
-        arguments: String,
-    },
-    PlayerConnected(i32),
-    BrowserCreated {
-        player_id: i32,
-        browser_id: u32,
-        code: i32,
-    },
-}
-
 struct CefPlugin {
-    server: Arc<Mutex<Server>>,
+    core: ServerCore,
     events: HashMap<String, (AmxIdent, String)>,
-    event_rx: Receiver<Event>,
     amx_list: Vec<AmxIdent>,
-    await_connect: HashMap<i32, Instant>,
-    ips: HashMap<i32, IpAddr>,
 }
 
 impl CefPlugin {
@@ -52,22 +26,14 @@ impl CefPlugin {
 
         let port = crate::utils::parse_config_field("port").unwrap_or(7777);
         let addr = SocketAddr::from((ip, port + PORT_OFFSET));
-        let server = Server::new(addr);
+        let core = ServerCore::new(addr).unwrap_or_else(|error| panic!("{error}"));
 
         info!("Bind CEF server on {:?}", addr);
 
-        let event_rx = {
-            let s = server.lock().unwrap();
-            s.receiver()
-        };
-
         CefPlugin {
-            server,
-            event_rx,
+            core,
             events: HashMap::new(),
             amx_list: Vec::new(),
-            await_connect: HashMap::new(),
-            ips: HashMap::new(),
         }
     }
 
@@ -78,16 +44,7 @@ impl CefPlugin {
         let player_ip = player_ip.to_string();
 
         if let Ok(addr) = player_ip.parse::<IpAddr>() {
-            trace!("allow_connection {} {:?}", player_id, addr);
-
-            self.ips.insert(player_id, addr);
-
-            {
-                let mut server = self.server.lock().unwrap();
-                server.allow_connection(player_id, addr);
-            }
-
-            self.add_to_await_list(player_id);
+            self.core.allow_connection(player_id, addr);
         }
 
         Ok(true)
@@ -95,17 +52,7 @@ impl CefPlugin {
 
     #[native(name = "cef_on_player_disconnect")]
     fn on_player_disconnect(&mut self, _: &Amx, player_id: i32) -> AmxResult<bool> {
-        trace!("remove_connection {} ", player_id);
-
-        let ip = self.ips.remove(&player_id);
-
-        {
-            let mut server = self.server.lock().unwrap();
-            server.remove_connection(player_id, ip);
-        }
-
-        self.remove_from_await_list(player_id);
-
+        self.core.remove_connection(player_id);
         Ok(true)
     }
 
@@ -114,17 +61,15 @@ impl CefPlugin {
         &mut self, _: &Amx, player_id: i32, browser_id: i32, url: AmxString, hidden: bool,
         focused: bool,
     ) -> AmxResult<bool> {
-        let mut server = self.server.lock().unwrap();
-        server.create_browser(player_id, browser_id, url.to_string(), hidden, focused);
+        self.core
+            .create_browser(player_id, browser_id, url.to_string(), hidden, focused);
 
         Ok(true)
     }
 
     #[native(name = "cef_destroy_browser")]
     fn destroy_browser(&mut self, _: &Amx, player_id: i32, browser_id: i32) -> AmxResult<bool> {
-        let mut server = self.server.lock().unwrap();
-        server.destroy_browser(player_id, browser_id);
-
+        self.core.destroy_browser(player_id, browser_id);
         Ok(true)
     }
 
@@ -132,9 +77,7 @@ impl CefPlugin {
     fn hide_browser(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, hide: bool,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.hide_browser(player_id, browser_id, hide);
-
+        self.core.hide_browser(player_id, browser_id, hide);
         Ok(true)
     }
 
@@ -142,9 +85,7 @@ impl CefPlugin {
     fn browser_listen_events(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, focused: bool,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.focus_browser(player_id, browser_id, focused);
-
+        self.core.focus_browser(player_id, browser_id, focused);
         Ok(true)
     }
 
@@ -200,8 +141,7 @@ impl CefPlugin {
             }
         }
 
-        let server = self.server.lock().unwrap();
-        server.emit_event(player_id, &event_name, arguments);
+        self.core.emit_event(player_id, &event_name, arguments);
 
         Ok(true)
     }
@@ -210,9 +150,7 @@ impl CefPlugin {
     fn block_input(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, listen: bool,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.always_listen_keys(player_id, browser_id, listen);
-
+        self.core.always_listen_keys(player_id, browser_id, listen);
         Ok(true)
     }
 
@@ -231,8 +169,7 @@ impl CefPlugin {
 
     #[native(name = "cef_player_has_plugin")]
     fn is_player_has_plugin(&mut self, _: &Amx, player_id: i32) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        let has_plugin = server.has_plugin(player_id);
+        let has_plugin = self.core.has_plugin(player_id);
         Ok(has_plugin)
     }
 
@@ -244,8 +181,8 @@ impl CefPlugin {
         let texture = texture.to_string();
         let url = url.to_string();
 
-        let server = self.server.lock().unwrap();
-        server.create_external_browser(player_id, browser_id, texture, url, scale);
+        self.core
+            .create_external_browser(player_id, browser_id, texture, url, scale);
 
         Ok(true)
     }
@@ -254,8 +191,7 @@ impl CefPlugin {
     fn append_to_object(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, object_id: i32,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.append_to_object(player_id, browser_id, object_id);
+        self.core.append_to_object(player_id, browser_id, object_id);
         Ok(true)
     }
 
@@ -263,8 +199,8 @@ impl CefPlugin {
     fn remove_from_object(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, object_id: i32,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.remove_from_object(player_id, browser_id, object_id);
+        self.core
+            .remove_from_object(player_id, browser_id, object_id);
         Ok(true)
     }
 
@@ -272,8 +208,7 @@ impl CefPlugin {
     fn toggle_dev_tools(
         &mut self, _: &Amx, player_id: i32, browser_id: i32, enabled: bool,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.toggle_dev_tools(player_id, browser_id, enabled);
+        self.core.toggle_dev_tools(player_id, browser_id, enabled);
         Ok(true)
     }
 
@@ -282,8 +217,8 @@ impl CefPlugin {
         &mut self, _: &Amx, player_id: i32, browser_id: u32, max_distance: f32,
         reference_distance: f32,
     ) -> AmxResult<bool> {
-        let server = self.server.lock().unwrap();
-        server.set_audio_settings(player_id, browser_id, max_distance, reference_distance);
+        self.core
+            .set_audio_settings(player_id, browser_id, max_distance, reference_distance);
         Ok(true)
     }
 
@@ -291,33 +226,8 @@ impl CefPlugin {
     fn load_url(
         &mut self, _: &Amx, player_id: i32, browser_id: u32, url: AmxString,
     ) -> AmxResult<bool> {
-        let url = url.to_string();
-        let server = self.server.lock().unwrap();
-
-        server.load_url(player_id, browser_id, url);
-
+        self.core.load_url(player_id, browser_id, url.to_string());
         Ok(true)
-    }
-
-    // utils
-    fn notify_timeout(&mut self) {
-        let mut keys = Vec::new();
-
-        for (&player_id, timing) in self.await_connect.iter() {
-            if timing.elapsed() >= INIT_TIMEOUT {
-                keys.push(player_id);
-                self.notify_connect(player_id, false);
-            }
-        }
-
-        keys.into_iter().for_each(|player_id| {
-            let result = self.remove_from_await_list(player_id);
-
-            trace!(
-                "notify_timeout::remove_from_await_list({}) {}",
-                player_id, result
-            );
-        });
     }
 
     fn notify_connect(&self, player_id: i32, success: bool) {
@@ -334,14 +244,6 @@ impl CefPlugin {
             samp::amx::get(ident)
                 .map(|amx| exec_public!(amx, "OnCefBrowserCreated", player_id, browser_id, code));
         });
-    }
-
-    fn add_to_await_list(&mut self, player_id: i32) {
-        self.await_connect.insert(player_id, Instant::now());
-    }
-
-    fn remove_from_await_list(&mut self, player_id: i32) -> bool {
-        self.await_connect.remove(&player_id).is_some()
     }
 }
 
@@ -363,9 +265,9 @@ impl SampPlugin for CefPlugin {
     }
 
     fn process_tick(&mut self) {
-        while let Ok(event) = self.event_rx.try_recv() {
+        while let Some(event) = self.core.poll_event() {
             match event {
-                Event::EmitEvent {
+                CoreEvent::EmitEvent {
                     player_id,
                     event,
                     arguments,
@@ -378,27 +280,24 @@ impl SampPlugin for CefPlugin {
                     }
                 }
 
-                Event::PlayerConnected(player) => {
-                    trace!("process_tick::PlayerConnected({})", player);
-
-                    if self.remove_from_await_list(player) {
-                        self.notify_connect(player, true);
-                    }
+                CoreEvent::PlayerInitialized { player_id, success } => {
+                    trace!(
+                        "process_tick::PlayerInitialized({}, {})",
+                        player_id, success
+                    );
+                    self.notify_connect(player_id, success);
                 }
 
-                Event::BrowserCreated {
+                CoreEvent::BrowserCreated {
                     player_id,
                     browser_id,
                     code,
                 } => {
                     trace!("process_tick::BrowserCreated({})", player_id);
-
                     self.notify_browser_created(player_id, browser_id, code);
                 }
             }
         }
-
-        self.notify_timeout();
     }
 }
 
@@ -424,23 +323,7 @@ initialize_plugin!(
     {
         samp::plugin::enable_process_tick();
         samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1251);
-        let _ = samp::plugin::logger(); // fuck logger
-
-        // let mut config = simplelog::ConfigBuilder::new();
-
-        // let config = config
-        //     .add_filter_allow_str("server")
-        //     .set_max_level(LevelFilter::Trace)
-        //     .build();
-
-        // CombinedLogger::init(vec![TermLogger::new(
-        //     LevelFilter::Trace,
-        //     config,
-        //     TerminalMode::Mixed,
-        //     simplelog::ColorChoice::Always,
-        // )])
-        // .unwrap();
-
+        let _ = samp::plugin::logger();
 
         CefPlugin::new()
     }
