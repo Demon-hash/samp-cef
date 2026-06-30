@@ -14,6 +14,7 @@ install=0
 clean=0
 jobs=""
 cmake_prefix_path="${CMAKE_PREFIX_PATH:-}"
+macos_deployment_target="${MACOSX_DEPLOYMENT_TARGET:-}"
 install_prefix=""
 install_component="samp-cef-openmp"
 declare -a cef_cmake_args=()
@@ -84,6 +85,21 @@ default_cmake_prefix_path() {
 		local joined
 		joined="$(IFS=';'; printf '%s' "${prefixes[*]}")"
 		cmake_prefix_path="$joined"
+	fi
+}
+
+default_macos_deployment_target() {
+	if [[ -n "$macos_deployment_target" || "$(uname -s)" != "Darwin" ]]; then
+		return
+	fi
+	if ! command -v xcrun >/dev/null 2>&1; then
+		return
+	fi
+
+	local sdk_version
+	sdk_version="$(xcrun --show-sdk-version 2>/dev/null || true)"
+	if [[ "$sdk_version" =~ ^([0-9]+)\. ]]; then
+		macos_deployment_target="${BASH_REMATCH[1]}.0"
 	fi
 }
 
@@ -203,6 +219,7 @@ if [[ "$grpc" != "OFF" ]]; then
 		export CMAKE_PREFIX_PATH="$cmake_prefix_path"
 	fi
 fi
+default_macos_deployment_target
 
 if (( clean )); then
 	rm -rf "$build_dir"
@@ -216,15 +233,19 @@ ext="$(component_ext)"
 if [[ "$grpc" != "OFF" ]]; then
 	if [[ -n "$openmp_ext_root" && -f "$openmp_ext_root/CMakeLists.txt" ]]; then
 		grpc_lib="$openmp_ext_build_dir/omp-grpc.$ext"
-		proto_cc="$openmp_ext_build_dir/generated/proto/omp_ext.pb.cc"
+		proto_h="$openmp_ext_build_dir/generated/proto/omp_ext.pb.h"
+		grpc_proto_h="$openmp_ext_build_dir/generated/proto/omp_ext.grpc.pb.h"
 
-		if [[ "$build_grpc" == "ON" || ( "$build_grpc" == "AUTO" && ( ! -f "$grpc_lib" || ! -f "$proto_cc" ) ) ]]; then
+		if [[ "$build_grpc" == "ON" || ( "$build_grpc" == "AUTO" && ( ! -f "$grpc_lib" || ! -f "$proto_h" || ! -f "$grpc_proto_h" ) ) ]]; then
 			printf '[samp-cef] Building omp-grpc in %s\n' "$openmp_ext_build_dir"
 			grpc_configure_args=(
 				-S "$openmp_ext_root"
 				-B "$openmp_ext_build_dir"
 				-DOPENMP_ROOT="$openmp_root"
 			)
+			if [[ -n "$macos_deployment_target" ]]; then
+				grpc_configure_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target")
+			fi
 			if (( ${#grpc_cmake_args[@]} > 0 )); then
 				grpc_configure_args+=("${grpc_cmake_args[@]}")
 			fi
@@ -249,6 +270,9 @@ cef_configure_args=(
 	-DOPEN_MP_SERVER_ROOT="$server_root"
 )
 
+if [[ -n "$macos_deployment_target" ]]; then
+	cef_configure_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target")
+fi
 if [[ -n "$install_prefix" ]]; then
 	cef_configure_args+=(-DCMAKE_INSTALL_PREFIX="$install_prefix")
 fi
