@@ -202,7 +202,10 @@ unsafe fn write_minidump(exception_info: *mut EXCEPTION_POINTERS) {
 
 unsafe extern "system" fn exception_filter(exception_info: *mut EXCEPTION_POINTERS) -> LONG {
     if ALREADY_SENT {
-        if let Some(origin) = EXCEPTION_FILTER.as_mut() {
+        // EXCEPTION_FILTER is Copy (it's just a function pointer) - read
+        // it by value instead of `.as_mut()`, which would create a `&mut`
+        // to a `static mut` and is a hard error under edition 2024.
+        if let Some(origin) = EXCEPTION_FILTER {
             return origin(exception_info);
         }
 
@@ -294,7 +297,7 @@ unsafe extern "system" fn exception_filter(exception_info: *mut EXCEPTION_POINTE
         "client crash captured"
     );
 
-    if let Some(origin) = EXCEPTION_FILTER.as_mut() {
+    if let Some(origin) = EXCEPTION_FILTER {
         return origin(exception_info);
     }
 
