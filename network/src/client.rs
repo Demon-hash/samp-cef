@@ -1,9 +1,10 @@
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct SkipServerVerification;
@@ -59,5 +60,19 @@ fn configure_insecure_client() -> anyhow::Result<ClientConfig> {
     tls_config.enable_early_data = true;
 
     let crypto = QuicClientConfig::try_from(tls_config)?;
-    Ok(ClientConfig::new(Arc::new(crypto)))
+    let mut client_config = ClientConfig::new(Arc::new(crypto));
+
+    // The server (network/src/server.rs) sends a keep-alive PING every 1s,
+    // but that only resets *our* idle timer if its packets actually reach
+    // us - it does nothing for the reverse direction. Without our own
+    // keep-alive, any one-way packet loss toward the server (plausible
+    // through the Windows host -> WSL2 -> Docker NAT path this client
+    // usually talks through) lets the server keep seeing us as alive
+    // (it's still receiving from us) while we independently decide the
+    // connection died, tearing down an actively-rendering browser.
+    let mut transport_config = TransportConfig::default();
+    transport_config.keep_alive_interval(Some(Duration::from_secs(1)));
+    client_config.transport_config(Arc::new(transport_config));
+
+    Ok(client_config)
 }
