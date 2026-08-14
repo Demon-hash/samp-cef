@@ -218,6 +218,20 @@ fn try_install_present_hook() -> bool {
         let device = device_ptr.read();
 
         if device.is_null() || (*device).lpVtbl.is_null() {
+            // Diagnostic-only, throttled to ~1/sec (this is called every
+            // render tick) - is samp.dll's own cached device pointer the
+            // thing actually holding up Present-hook installation, and for
+            // how long?
+            static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut last_log = LAST_LOG.lock();
+            if last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                tracing::debug!(
+                    device_null = device.is_null(),
+                    "try_install_present_hook: samp.dll device pointer not ready yet"
+                );
+                *last_log = Some(Instant::now());
+            }
+
             return false;
         }
 
@@ -361,6 +375,15 @@ struct RenderState {
 }
 
 extern "C" fn drawing_event() {
+    // Diagnostic-only: pin down whether the multi-second gap before the
+    // Present hook installs is because this render tick simply isn't
+    // firing yet (GTA still on its own loading screen) or because it's
+    // firing but samp.dll hasn't cached its own device pointer yet.
+    static FIRST_CALL: std::sync::Once = std::sync::Once::new();
+    FIRST_CALL.call_once(|| {
+        tracing::debug!("drawing_event: first call observed");
+    });
+
     try_install_dl_rw_render_hook();
 
     if let Some(render) = Render::get() {
