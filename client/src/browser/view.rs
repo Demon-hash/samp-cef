@@ -248,20 +248,82 @@ impl View {
         if let Some(mut dest) = self.container.as_mut().and_then(|rw| rw.bytes()) {
             let destination_pitch = dest.pitch;
             let source_pitch = self.width.saturating_mul(4);
+            let source_len = bytes.len();
+            let dest_len = dest.len();
             let dest = &mut *dest;
 
             let dest = dest.as_mut_ptr();
             let pixels_origin = bytes.as_ptr();
 
             for cef_rect in rects {
-                for y in cef_rect.y as usize..(cef_rect.y as usize + cef_rect.height as usize) {
+                // CEF's dirty rects describe the browser's *current* size,
+                // reported asynchronously via OnPaint. If a resize raced
+                // with this update, the texture we're holding (`self.width`/
+                // `self.height`, fixed at the last resize()) can be smaller
+                // than what CEF now reports - writing rect-sized spans
+                // straight into `dest`/`pixels_origin` without checking that
+                // is an out-of-bounds write into whatever the RenderWare
+                // raster's allocation happens to sit next to on the heap.
+                // Silently drop anything that doesn't fit both buffers
+                // instead of copying blind; a dropped partial repaint is far
+                // cheaper than a corrupted heap that crashes somewhere
+                // unrelated moments later.
+                if cef_rect.x < 0 || cef_rect.y < 0 || cef_rect.width <= 0 || cef_rect.height <= 0 {
+                    tracing::warn!(?cef_rect, "update_texture: negative/empty dirty rect, skipping");
+                    continue;
+                }
+
+                let (x, y, w, h) = (
+                    cef_rect.x as usize,
+                    cef_rect.y as usize,
+                    cef_rect.width as usize,
+                    cef_rect.height as usize,
+                );
+
+                let Some(row_bytes) = w.checked_mul(4) else {
+                    tracing::warn!(?cef_rect, "update_texture: row width overflow, skipping");
+                    continue;
+                };
+
+                let fits_dest = y.checked_add(h).is_some_and(|bottom| bottom <= self.height)
+                    && x.checked_add(w).is_some_and(|right| right <= self.width);
+
+                if !fits_dest {
+                    tracing::warn!(
+                        ?cef_rect, width = self.width, height = self.height,
+                        "update_texture: dirty rect exceeds current view size, skipping"
+                    );
+                    continue;
+                }
+
+                let mut out_of_bounds = false;
+
+                for row in y..(y + h) {
+                    let destination_index = destination_pitch * row + x * 4;
+                    let source_index = source_pitch * row + x * 4;
+
+                    let dest_row_ok = destination_index.checked_add(row_bytes)
+                        .is_some_and(|end| end <= dest_len);
+                    let source_row_ok = source_index.checked_add(row_bytes)
+                        .is_some_and(|end| end <= source_len);
+
+                    if !dest_row_ok || !source_row_ok {
+                        out_of_bounds = true;
+                        break;
+                    }
+
                     unsafe {
-                        let destination_index = destination_pitch * y + cef_rect.x as usize * 4;
-                        let source_index = source_pitch * y + cef_rect.x as usize * 4;
                         let ptr = dest.add(destination_index);
                         let pixels = pixels_origin.add(source_index);
-                        std::ptr::copy(pixels, ptr, cef_rect.width as usize * 4);
+                        std::ptr::copy(pixels, ptr, row_bytes);
                     }
+                }
+
+                if out_of_bounds {
+                    tracing::warn!(
+                        ?cef_rect, destination_pitch, source_pitch, dest_len, source_len,
+                        "update_texture: computed row exceeds buffer bounds, stopped early"
+                    );
                 }
             }
 
