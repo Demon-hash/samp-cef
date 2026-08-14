@@ -162,6 +162,17 @@ pub extern "C" fn cef_client_initialize() {
     });
 }
 
+/// Returns non-zero while a CEF browser currently holds exclusive input
+/// focus (e.g. the login screen) - other injected modules in this same
+/// process (a launcher's own chat overlay, notably) can call this via
+/// GetProcAddress to avoid opening their own UI on top of it. cdecl to
+/// match Rust's default extern "C" ABI on this target - callers must not
+/// assume stdcall.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_client_is_input_blocked() -> i32 {
+    if app::is_input_blocked() { 1 } else { 0 }
+}
+
 /// # Safety
 /// `instance` must be a valid module handle provided by the loader.
 #[unsafe(no_mangle)]

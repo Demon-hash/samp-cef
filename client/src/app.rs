@@ -359,6 +359,16 @@ fn shitty() {
     }
 }
 
+// Exposed (via cef_client_is_input_blocked in lib.rs) so other injected
+// modules sharing this process - e.g. a launcher's own custom chat overlay -
+// can avoid opening their own UI on top of an active, input-grabbing CEF
+// browser (the login screen, most notably).
+pub fn is_input_blocked() -> bool {
+    App::get()
+        .map(|app| app.manager.lock().is_input_blocked())
+        .unwrap_or(false)
+}
+
 // inside GTA thread
 pub fn mainloop() {
     if let Some(app) = App::get() {
