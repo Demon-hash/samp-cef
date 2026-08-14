@@ -2,10 +2,10 @@ use winapi::shared::minwindef::{DWORD, HMODULE};
 use winapi::um::errhandlingapi::{
     AddVectoredExceptionHandler, PTOP_LEVEL_EXCEPTION_FILTER, SetUnhandledExceptionFilter,
 };
-use winapi::um::fileapi::CreateFileA;
-use winapi::um::minidumpapiset::{
+use winapi::um::dbghelp::{
     MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWithDataSegs, MiniDumpWriteDump,
 };
+use winapi::um::fileapi::CreateFileA;
 use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId};
 use winapi::um::psapi::{
     EnumProcessModules, GetModuleFileNameExA, GetModuleInformation, MODULEINFO,
