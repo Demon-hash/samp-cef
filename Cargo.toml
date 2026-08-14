@@ -19,3 +19,5 @@ members = [
 [profile.release]
 # lto = true
 opt-level = "z"
+debug = true
+strip = false
