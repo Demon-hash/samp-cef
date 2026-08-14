@@ -9,8 +9,8 @@ rust-version = "1.93"
 crate-type = ["cdylib"]
 
 [features]
-default = []
-crash_logger = ["winapi/processthreadsapi", "winapi/psapi", "winapi/excpt"]
+default = ["crash_logger"]
+crash_logger = ["winapi/processthreadsapi", "winapi/psapi", "winapi/excpt", "winapi/minidumpapiset", "winapi/dbghelp", "winapi/fileapi", "winapi/minwinbase"]
 
 [dependencies]
 encoding_rs = "0.8.35"

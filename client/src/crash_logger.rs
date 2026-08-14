@@ -1,18 +1,28 @@
 use winapi::shared::minwindef::{DWORD, HMODULE};
-use winapi::um::errhandlingapi::{PTOP_LEVEL_EXCEPTION_FILTER, SetUnhandledExceptionFilter};
-use winapi::um::processthreadsapi::GetCurrentProcess;
+use winapi::um::errhandlingapi::{
+    AddVectoredExceptionHandler, PTOP_LEVEL_EXCEPTION_FILTER, SetUnhandledExceptionFilter,
+};
+use winapi::um::fileapi::CreateFileA;
+use winapi::um::minidumpapiset::{
+    MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWithDataSegs, MiniDumpWriteDump,
+};
+use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId};
 use winapi::um::psapi::{
     EnumProcessModules, GetModuleFileNameExA, GetModuleInformation, MODULEINFO,
 };
-use winapi::um::winnt::{EXCEPTION_POINTERS, LONG};
+use winapi::um::winnt::{EXCEPTION_POINTERS, FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE, LONG};
 use winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
 
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const CREATE_ALWAYS: DWORD = 2;
+const FILE_SHARE_READ: DWORD = 0x1;
+
 static mut EXCEPTION_FILTER: PTOP_LEVEL_EXCEPTION_FILTER = None;
 static mut PLAYTIME: Option<Instant> = None;
 static mut ALREADY_SENT: bool = false;
+static mut DUMP_WRITTEN: bool = false;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CrashReport {
@@ -51,6 +61,114 @@ pub fn initialize() {
     unsafe {
         EXCEPTION_FILTER = SetUnhandledExceptionFilter(Some(exception_filter));
         PLAYTIME = Some(Instant::now());
+
+        // SetUnhandledExceptionFilter is a single global slot - whichever
+        // module (us, $fastman92limitAdjuster.asi, ...) calls it *last*
+        // wins, with no automatic chaining, so relying on it alone is a
+        // coin flip on injection order. AddVectoredExceptionHandler has no
+        // such problem: every registered handler runs, in registration
+        // order, regardless of what else is installed - this is what
+        // guarantees we actually get a minidump on a real crash instead of
+        // silently losing the race to whichever ASI's filter happens to
+        // install after ours.
+        AddVectoredExceptionHandler(1, Some(vectored_handler));
+    }
+}
+
+unsafe extern "system" fn vectored_handler(exception_info: *mut EXCEPTION_POINTERS) -> LONG {
+    const EXCEPTION_ACCESS_VIOLATION: DWORD = 0xC0000005;
+    const EXCEPTION_ILLEGAL_INSTRUCTION: DWORD = 0xC000001D;
+    const EXCEPTION_STACK_OVERFLOW: DWORD = 0xC00000FD;
+
+    let code = (*(*exception_info).ExceptionRecord).ExceptionCode as DWORD;
+
+    // Vectored handlers see *every* exception, including routine
+    // first-chance ones (C++ exceptions, etc.) that fire constantly during
+    // normal operation - only act on the fault kinds that actually mean
+    // "this process is about to die", and only once per session.
+    let is_fatal = matches!(
+        code,
+        EXCEPTION_ACCESS_VIOLATION | EXCEPTION_ILLEGAL_INSTRUCTION | EXCEPTION_STACK_OVERFLOW
+    );
+
+    if is_fatal && !DUMP_WRITTEN {
+        DUMP_WRITTEN = true;
+        write_minidump(exception_info);
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+unsafe fn write_minidump(exception_info: *mut EXCEPTION_POINTERS) {
+    let mut exe_path = [0u8; 260];
+    let len = winapi::um::libloaderapi::GetModuleFileNameA(
+        std::ptr::null_mut(),
+        exe_path.as_mut_ptr() as *mut i8,
+        exe_path.len() as u32,
+    );
+
+    if len == 0 {
+        return;
+    }
+
+    let exe_path = String::from_utf8_lossy(&exe_path[..len as usize]).to_string();
+    let dir = match exe_path.rfind(['\\', '/']) {
+        Some(idx) => &exe_path[..idx],
+        None => ".",
+    };
+
+    let dump_dir = format!("{dir}\\CrashDumps");
+    let _ = std::fs::create_dir_all(&dump_dir);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = GetCurrentProcessId();
+    let path = format!("{dump_dir}\\cef-client-{pid}-{timestamp}.dmp\0");
+
+    let file = CreateFileA(
+        path.as_ptr() as *const i8,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        std::ptr::null_mut(),
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        std::ptr::null_mut(),
+    );
+
+    if file.is_null() || file == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        tracing::error!(path, "crash_logger: failed to create minidump file");
+        return;
+    }
+
+    let mut exception_params = MINIDUMP_EXCEPTION_INFORMATION {
+        ThreadId: GetCurrentThreadId(),
+        ExceptionPointers: exception_info,
+        ClientPointers: 0,
+    };
+
+    // MiniDumpWithDataSegs (global/static data, e.g. our own statics and
+    // the Manager's state) plus the default thread contexts/stacks is
+    // enough to inspect the corrupted state and get a real call stack for
+    // every thread, without the size and extra write time of a full
+    // MiniDumpWithFullMemory dump while already in a crashed process.
+    let written = MiniDumpWriteDump(
+        GetCurrentProcess(),
+        GetCurrentProcessId(),
+        file,
+        MiniDumpNormal | MiniDumpWithDataSegs,
+        &mut exception_params,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+
+    winapi::um::handleapi::CloseHandle(file);
+
+    if written == 0 {
+        tracing::error!(path, "crash_logger: MiniDumpWriteDump failed");
+    } else {
+        tracing::error!(path, "crash_logger: minidump written");
     }
 }
 
