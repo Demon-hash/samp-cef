@@ -180,6 +180,19 @@ fn on_device_created() {
 }
 
 fn on_device_render(_: &mut IDirect3DDevice9) {
+    // EndScene (this hook, via the device proxy) fires as soon as the
+    // device exists - confirmed via a captured cef_client.log to start
+    // right after device creation. drawing_event() (GTA's own render-tick
+    // function at a fixed address) doesn't get called until GTA finishes
+    // its own loading screen and starts real 3D rendering, ~10s later in
+    // that same log - but mainloop() (event queue processing: connecting
+    // to the CEF server, handling CreateBrowser, etc.) was only ever
+    // driven from drawing_event()'s on_render() call, so all of that sat
+    // idle for the entire ~10s gap even though the device/renderer were
+    // already up. Drive it from here too so CEF's own connect/browser
+    // flow isn't gated on GTA's unrelated loading-screen timing.
+    on_render();
+
     if !try_install_present_hook() {
         render();
     }
