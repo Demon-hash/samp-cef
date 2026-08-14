@@ -1,23 +1,51 @@
-use winapi::shared::minwindef::{DWORD, HMODULE};
+use winapi::shared::minwindef::{BOOL, DWORD, HMODULE};
 use winapi::um::errhandlingapi::{
     AddVectoredExceptionHandler, PTOP_LEVEL_EXCEPTION_FILTER, SetUnhandledExceptionFilter,
-};
-use winapi::um::dbghelp::{
-    MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWithDataSegs, MiniDumpWriteDump,
 };
 use winapi::um::fileapi::CreateFileA;
 use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId};
 use winapi::um::psapi::{
     EnumProcessModules, GetModuleFileNameExA, GetModuleInformation, MODULEINFO,
 };
-use winapi::um::winnt::{EXCEPTION_POINTERS, FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE, LONG};
+use winapi::um::winnt::{EXCEPTION_POINTERS, FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE, HANDLE, LONG};
 use winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
 
 use std::io::Write;
+use std::os::raw::c_void;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const CREATE_ALWAYS: DWORD = 2;
 const FILE_SHARE_READ: DWORD = 0x1;
+
+// This winapi version (0.3.9) doesn't declare the DbgHelp minidump API at
+// all (verified against the crate source - src/um/dbghelp.rs has no
+// MiniDump* items), even though "dbghelp" is a valid feature name for the
+// rest of that header. MiniDumpWriteDump's signature has been stable since
+// Windows XP, so binding it by hand here is safe and avoids pulling in an
+// extra crate just for one function.
+type MinidumpType = DWORD;
+const MINI_DUMP_NORMAL: MinidumpType = 0x0000_0000;
+const MINI_DUMP_WITH_DATA_SEGS: MinidumpType = 0x0000_0001;
+
+#[repr(C)]
+struct MinidumpExceptionInformation {
+    thread_id: DWORD,
+    exception_pointers: *mut EXCEPTION_POINTERS,
+    client_pointers: BOOL,
+}
+
+#[link(name = "dbghelp")]
+unsafe extern "system" {
+    fn MiniDumpWriteDump(
+        h_process: HANDLE,
+        process_id: DWORD,
+        h_file: HANDLE,
+        dump_type: MinidumpType,
+        exception_param: *mut MinidumpExceptionInformation,
+        user_stream_param: *mut c_void,
+        callback_param: *mut c_void,
+    ) -> BOOL;
+}
 
 static mut EXCEPTION_FILTER: PTOP_LEVEL_EXCEPTION_FILTER = None;
 static mut PLAYTIME: Option<Instant> = None;
@@ -142,22 +170,22 @@ unsafe fn write_minidump(exception_info: *mut EXCEPTION_POINTERS) {
         return;
     }
 
-    let mut exception_params = MINIDUMP_EXCEPTION_INFORMATION {
-        ThreadId: GetCurrentThreadId(),
-        ExceptionPointers: exception_info,
-        ClientPointers: 0,
+    let mut exception_params = MinidumpExceptionInformation {
+        thread_id: GetCurrentThreadId(),
+        exception_pointers: exception_info,
+        client_pointers: 0,
     };
 
-    // MiniDumpWithDataSegs (global/static data, e.g. our own statics and
-    // the Manager's state) plus the default thread contexts/stacks is
+    // MINI_DUMP_WITH_DATA_SEGS (global/static data, e.g. our own statics
+    // and the Manager's state) plus the default thread contexts/stacks is
     // enough to inspect the corrupted state and get a real call stack for
     // every thread, without the size and extra write time of a full
-    // MiniDumpWithFullMemory dump while already in a crashed process.
+    // full-memory dump while already in a crashed process.
     let written = MiniDumpWriteDump(
         GetCurrentProcess(),
         GetCurrentProcessId(),
         file,
-        MiniDumpNormal | MiniDumpWithDataSegs,
+        MINI_DUMP_NORMAL | MINI_DUMP_WITH_DATA_SEGS,
         &mut exception_params,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
