@@ -31,7 +31,19 @@ use retour::GenericDetour;
 
 const CEF_SERVER_PORT_OFFSET: u16 = 2;
 pub const CEF_PLUGIN_VERSION: i32 = 0x00_01_00;
-const CONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+// The server only accepts a CEF QUIC connection from a player's IP once
+// its own connection handling has registered that player (allow_connection
+// in server-core) - which happens shortly after, not exactly when, the
+// client sees NetGame::get().addr() become valid. A captured
+// cef_client.log showed the client's first few attempts routinely arrive
+// before that registration lands and get reset, with 3 failed attempts
+// (at the old 1s/2s/4s doubling) burning ~7s before the 4th attempt
+// finally succeeded - almost all of that is this backoff being far more
+// conservative than the server actually needs, not real unavailability.
+// Starting faster costs nothing once the server is actually ready (it'll
+// just succeed on an earlier attempt) and only matters during this
+// brief post-connect window, not sustained retry pressure.
+const CONNECT_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const AUDIO_SPATIAL_UPDATE_INTERVAL: Duration = Duration::from_millis(33);
 
