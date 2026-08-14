@@ -111,11 +111,24 @@ impl RwContainer {
 impl Drop for RwContainer {
     fn drop(&mut self) {
         unsafe {
+            // RwTexture::new() takes ownership of the raster passed to it -
+            // RwTextureDestroy() (the real engine function) already frees
+            // its raster internally as part of tearing down the texture.
+            // `raster` here is only a convenience handle for bytes()/lock()
+            // while the container is alive, not a second, independently-
+            // owned object - destroying it separately after the texture is
+            // already gone is a double free on the same RwRaster, which is
+            // exactly what a captured crash dump showed: RtlFreeHeap
+            // succeeding for the texture's destroy, immediately followed by
+            // a heap-corruption write crashing inside the second, redundant
+            // free.
             if let Some(mut texture) = self.texture.take() {
                 texture.as_mut().destroy();
-            }
-
-            if let Some(mut raster) = self.raster.take() {
+                self.raster.take();
+            } else if let Some(mut raster) = self.raster.take() {
+                // No texture was ever created around this raster (NonNull::new
+                // returned None for `texture` in `new()`) - it's still ours
+                // to free directly.
                 raster.as_mut().destroy();
             }
         }
