@@ -406,8 +406,14 @@ pub fn mainloop() {
                 }
 
                 Event::DestroyBrowser(id) => {
-                    let mut manager = app.manager.lock();
-                    manager.close_browser(id, true);
+                    let show_cursor = {
+                        let mut manager = app.manager.lock();
+                        manager.close_browser(id, true);
+
+                        manager.is_input_blocked() && !CMenuManager::is_menu_active()
+                    };
+
+                    client_api::samp::inputs::show_cursor(show_cursor);
                 }
 
                 Event::HideBrowser(id, hide) => {
