@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["crash_logger"]
-crash_logger = ["winapi/processthreadsapi", "winapi/psapi", "winapi/excpt", "winapi/minidumpapiset", "winapi/dbghelp", "winapi/fileapi", "winapi/minwinbase"]
+crash_logger = ["winapi/processthreadsapi", "winapi/psapi", "winapi/excpt", "winapi/dbghelp", "winapi/fileapi", "winapi/minwinbase"]
 
 [dependencies]
 encoding_rs = "0.8.35"
