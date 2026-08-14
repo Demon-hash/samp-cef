@@ -334,19 +334,66 @@ impl View {
     }
 
     pub fn update_popup(&mut self, bytes: &[u8], popup_rect: &cef_rect_t) {
-        let set_pixels = |dest: &mut [u8], pitch: usize| {
-            let dest = dest.as_mut_ptr();
-            let popup_pitch = popup_rect.width * 4;
+        // Same missing-bounds-check hazard as update_texture (see the
+        // comment there) - CEF popups (autofill/save-password dropdowns
+        // included, not just <select> elements) go through this exact
+        // path via on_popup_show, so a plain password <input> is enough
+        // to reach it even with no explicit popup UI on the page.
+        if popup_rect.x < 0 || popup_rect.y < 0 || popup_rect.width <= 0 || popup_rect.height <= 0 {
+            tracing::warn!(?popup_rect, "update_popup: negative/empty popup rect, skipping");
+            return;
+        }
 
-            for y in 0..popup_rect.height {
-                let source_index = y * popup_pitch;
-                let dest_index = (y + popup_rect.y) * pitch as i32 + popup_rect.x * 4;
+        let width = self.width;
+        let height = self.height;
+        let source_len = bytes.len();
+
+        let (x, y, w, h) = (
+            popup_rect.x as usize,
+            popup_rect.y as usize,
+            popup_rect.width as usize,
+            popup_rect.height as usize,
+        );
+
+        let Some(row_bytes) = w.checked_mul(4) else {
+            tracing::warn!(?popup_rect, "update_popup: row width overflow, skipping");
+            return;
+        };
+
+        let fits_view = y.checked_add(h).is_some_and(|bottom| bottom <= height)
+            && x.checked_add(w).is_some_and(|right| right <= width);
+
+        if !fits_view {
+            tracing::warn!(
+                ?popup_rect, width, height,
+                "update_popup: popup rect exceeds current view size, skipping"
+            );
+            return;
+        }
+
+        let set_pixels = |dest: &mut [u8], pitch: usize| {
+            let dest_len = dest.len();
+            let dest = dest.as_mut_ptr();
+
+            for row in 0..h {
+                let source_index = row * row_bytes;
+                let dest_index = (row + y) * pitch + x * 4;
+
+                let source_ok = source_index.checked_add(row_bytes).is_some_and(|end| end <= source_len);
+                let dest_ok = dest_index.checked_add(row_bytes).is_some_and(|end| end <= dest_len);
+
+                if !source_ok || !dest_ok {
+                    tracing::warn!(
+                        ?popup_rect, pitch, dest_len, source_len,
+                        "update_popup: computed row exceeds buffer bounds, stopped early"
+                    );
+                    break;
+                }
 
                 unsafe {
-                    let surface_data = dest.add(dest_index as usize);
-                    let new_data = bytes.as_ptr().add(source_index as usize);
-
-                    std::ptr::copy(new_data, surface_data, popup_pitch as usize);
+                    let surface_data = dest.add(dest_index);
+                    let new_data = bytes.as_ptr().add(source_index);
+                    std::ptr::copy(new_data, surface_data, row_bytes);
                 }
             }
         };
