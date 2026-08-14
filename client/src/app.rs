@@ -205,7 +205,10 @@ impl App {
     }
 
     pub fn connect(&mut self) {
-        if self.network.is_some() {
+        // Once both SA:MP hooks are installed and a CEF connection is open
+        // (whichever of this or try_connect_via_command_line() got there
+        // first), there's nothing left for this to do every frame.
+        if self.samp_ready && self.network.is_some() {
             return;
         }
 
@@ -214,29 +217,57 @@ impl App {
             return;
         }
 
-        if let Some(mut addr) = NetGame::get().addr() {
+        if let Some(addr) = NetGame::get().addr() {
             if !self.samp_ready {
                 App::initialize_hooks();
                 self.samp_ready = true;
                 self.manager.lock().initialize_cef();
+                tracing::debug!(game_server = %addr, "SA:MP server detected");
             }
 
-            tracing::debug!(game_server = %addr, "SA:MP server detected");
-
-            addr.set_port(addr.port() + CEF_SERVER_PORT_OFFSET);
-
-            tracing::trace!(
-                server = %addr,
-                elapsed_ms = self.initialization.elapsed().as_millis(),
-                "queuing CEF server connection"
-            );
-
-            let network = NetworkClient::new(self.event_tx.clone());
-            network.send(Event::Connect(addr));
-
-            self.network = Some(network);
-            self.next_connect_attempt = now + self.connect_backoff;
+            self.open_cef_connection(addr, now);
         }
+    }
+
+    // NetGame::get().addr() (SA:MP's own CNetGame object, populated from
+    // its *own* connection sequence) stays null until SA:MP's client-side
+    // state machine actually starts ticking - confirmed via a captured
+    // cef_client.log to be ~10-11s after process start on this machine,
+    // apparently gated on GTA's own engine bootstrap finishing, nothing
+    // CEF-related. The launcher already knows the target server and passes
+    // it on the process command line (`-h <ip> -p <port>`, see
+    // GameLauncher.cs's BuildCommandLine) - GetCommandLineW() is valid from
+    // the very first instant the process exists, so read it directly and
+    // open the CEF server connection immediately instead of waiting on
+    // SA:MP's own state. connect()'s NetGame-based path is left in place
+    // unchanged as a fallback (open_cef_connection() no-ops if a
+    // connection is already open) for launchers/menus that don't pass
+    // -h/-p on the command line.
+    pub fn try_connect_via_command_line(&mut self) {
+        if let Some(addr) = command_line_server_addr() {
+            tracing::debug!(game_server = %addr, "SA:MP server address found on the command line");
+            self.open_cef_connection(addr, Instant::now());
+        }
+    }
+
+    fn open_cef_connection(&mut self, mut addr: SocketAddr, now: Instant) {
+        if self.network.is_some() {
+            return;
+        }
+
+        addr.set_port(addr.port() + CEF_SERVER_PORT_OFFSET);
+
+        tracing::trace!(
+            server = %addr,
+            elapsed_ms = self.initialization.elapsed().as_millis(),
+            "queuing CEF server connection"
+        );
+
+        let network = NetworkClient::new(self.event_tx.clone());
+        network.send(Event::Connect(addr));
+
+        self.network = Some(network);
+        self.next_connect_attempt = now + self.connect_backoff;
     }
 
     pub fn disconnect(&mut self) {
@@ -313,8 +344,40 @@ pub fn initialize() {
         // no-op safety net for whatever hasn't warmed up yet by then.
         if let Some(app) = App::get() {
             app.manager.lock().initialize_cef();
+            app.try_connect_via_command_line();
         }
     }
+}
+
+// See try_connect_via_command_line()'s doc comment for why this exists -
+// GetCommandLineW() is valid immediately, independent of any SA:MP/GTA
+// internal state.
+fn command_line_server_addr() -> Option<SocketAddr> {
+    let raw = unsafe {
+        let ptr = winapi::um::processenv::GetCommandLineW();
+        if ptr.is_null() {
+            return None;
+        }
+
+        let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice)
+    };
+
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut ip: Option<std::net::IpAddr> = None;
+    let mut port: Option<u16> = None;
+
+    let mut iter = tokens.iter();
+    while let Some(&token) = iter.next() {
+        match token {
+            "-h" => ip = iter.next().and_then(|value| value.parse().ok()),
+            "-p" => port = iter.next().and_then(|value| value.parse().ok()),
+            _ => {}
+        }
+    }
+
+    Some(SocketAddr::from((ip?, port?)))
 }
 
 pub fn uninitialize() {
